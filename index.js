@@ -369,17 +369,221 @@ class MarketPeakDataAggregator {
 
   parseJsonFromText(text) {
     if (!text || typeof text !== "string") throw new Error("Empty AI response");
-    const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
-    if (fenced && fenced[1]) return JSON.parse(fenced[1]);
-    try {
-      return JSON.parse(text);
-    } catch (_) {}
-    const first = text.indexOf("{");
-    const last = text.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) {
-      return JSON.parse(text.slice(first, last + 1));
+
+    // Progressive sanitization levels - try each level if the previous fails
+    const sanitizationLevels = [
+      (text) => this.sanitizeJsonText(text), // Basic sanitization
+      (text) => this.aggressiveSanitizeJsonText(text), // More aggressive sanitization
+      (text) => this.emergencySanitizeJsonText(text), // Emergency fallback
+    ];
+
+    for (let level = 0; level < sanitizationLevels.length; level++) {
+      try {
+        const sanitizedText = sanitizationLevels[level](text);
+        console.log(`🧹 [JSON] Trying sanitization level ${level + 1}`);
+
+        // Try to extract JSON from code fences first
+        const fenced = sanitizedText.match(/```json\s*([\s\S]*?)\s*```/i);
+        if (fenced && fenced[1]) {
+          try {
+            const result = JSON.parse(fenced[1]);
+            console.log(
+              `✅ [JSON] Successfully parsed fenced JSON at level ${level + 1}`
+            );
+            return result;
+          } catch (error) {
+            console.warn(
+              `❌ [JSON] Failed to parse fenced JSON at level ${level + 1}:`,
+              error.message
+            );
+          }
+        }
+
+        // Try to parse the entire sanitized text
+        try {
+          const result = JSON.parse(sanitizedText);
+          console.log(
+            `✅ [JSON] Successfully parsed full text at level ${level + 1}`
+          );
+          return result;
+        } catch (error) {
+          console.warn(
+            `❌ [JSON] Failed to parse full text at level ${level + 1}:`,
+            error.message
+          );
+        }
+
+        // Extract JSON object boundaries and try to parse
+        const first = sanitizedText.indexOf("{");
+        const last = sanitizedText.lastIndexOf("}");
+        if (first !== -1 && last !== -1 && last > first) {
+          const jsonStr = sanitizedText.slice(first, last + 1);
+          try {
+            const result = JSON.parse(jsonStr);
+            console.log(
+              `✅ [JSON] Successfully parsed extracted JSON at level ${
+                level + 1
+              }`
+            );
+            return result;
+          } catch (error) {
+            console.warn(
+              `❌ [JSON] Failed to parse extracted JSON at level ${level + 1}:`,
+              error.message
+            );
+            if (level === sanitizationLevels.length - 1) {
+              // Only log detailed error info on final attempt
+              console.error(
+                "Extracted JSON (first 500 chars):",
+                jsonStr.substring(0, 500)
+              );
+              console.error(
+                "Character codes around error position:",
+                this.debugCharacterCodes(jsonStr, error.message)
+              );
+            }
+          }
+        }
+      } catch (sanitizationError) {
+        console.warn(
+          `❌ [JSON] Sanitization level ${level + 1} failed:`,
+          sanitizationError.message
+        );
+      }
     }
-    throw new Error("No JSON found in AI response");
+
+    throw new Error(
+      `JSON parsing failed at all sanitization levels. Raw response length: ${text.length}`
+    );
+  }
+
+  /**
+   * Basic sanitization for JSON text
+   */
+  sanitizeJsonText(text) {
+    try {
+      // Remove or replace common problematic control characters
+      let sanitized = text
+        // Remove null bytes and other control characters except newlines, tabs, and carriage returns
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+        // Fix common escape sequence issues
+        .replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, "\\\\")
+        // Remove BOM if present
+        .replace(/^\uFEFF/, "")
+        // Normalize whitespace but preserve structure
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n");
+
+      return sanitized;
+    } catch (error) {
+      console.warn("❌ [JSON] Error during basic sanitization:", error.message);
+      return text;
+    }
+  }
+
+  /**
+   * More aggressive sanitization for problematic JSON
+   */
+  aggressiveSanitizeJsonText(text) {
+    try {
+      let sanitized = text
+        // Remove all control characters except basic whitespace
+        .replace(/[\x00-\x1F\x7F]/g, (match) => {
+          // Keep essential whitespace characters
+          if (match === "\n" || match === "\t" || match === "\r") return match;
+          return ""; // Remove other control characters
+        })
+        // Fix invalid escape sequences more aggressively
+        .replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, "\\\\")
+        // Handle problematic quotes in strings
+        .replace(/"([^"]*(?:\\.[^"]*)*)"/g, (match, content) => {
+          // Properly escape any unescaped quotes within the string
+          const escaped = content.replace(/(?<!\\)"/g, '\\"');
+          return `"${escaped}"`;
+        })
+        // Remove multiple consecutive spaces but preserve single spaces
+        .replace(/[ \t]+/g, " ")
+        // Clean up newlines
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .replace(/\n+/g, "\n")
+        // Remove BOM and other unicode issues
+        .replace(/^\uFEFF/, "")
+        .replace(/[\uFFF0-\uFFFF]/g, "");
+
+      return sanitized;
+    } catch (error) {
+      console.warn(
+        "❌ [JSON] Error during aggressive sanitization:",
+        error.message
+      );
+      return text;
+    }
+  }
+
+  /**
+   * Emergency fallback sanitization - very aggressive cleanup
+   */
+  emergencySanitizeJsonText(text) {
+    try {
+      let sanitized = text
+        // Keep only printable ASCII characters plus basic whitespace
+        .replace(/[^\x20-\x7E\n\t\r]/g, "")
+        // Fix any remaining escape sequences
+        .replace(/\\(?!["\\/bfnrt])/g, "\\\\")
+        // Clean up quotes - remove any problematic quote patterns
+        .replace(/"+/g, '"')
+        // Remove any remaining control characters
+        .replace(/[\x00-\x1F\x7F]/g, (match) => {
+          if (match === "\n" || match === "\t" || match === "\r") return match;
+          return "";
+        })
+        // Normalize all whitespace
+        .replace(/\s+/g, " ")
+        .replace(/\s*([{}[\],:])\s*/g, "$1")
+        // Ensure proper spacing around JSON structural elements
+        .replace(/([{}[\]])/g, " $1 ")
+        .replace(/: /g, ": ")
+        .replace(/, /g, ", ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      return sanitized;
+    } catch (error) {
+      console.warn(
+        "❌ [JSON] Error during emergency sanitization:",
+        error.message
+      );
+      return text;
+    }
+  }
+
+  /**
+   * Debug helper to show character codes around error position
+   */
+  debugCharacterCodes(jsonStr, errorMessage) {
+    try {
+      // Extract position from error message
+      const positionMatch = errorMessage.match(/position (\d+)/);
+      if (!positionMatch) return "No position found in error";
+
+      const position = parseInt(positionMatch[1]);
+      const start = Math.max(0, position - 10);
+      const end = Math.min(jsonStr.length, position + 10);
+      const snippet = jsonStr.slice(start, end);
+
+      return snippet
+        .split("")
+        .map((char, index) => {
+          const actualIndex = start + index;
+          const charCode = char.charCodeAt(0);
+          const marker = actualIndex === position ? " <-- ERROR" : "";
+          return `[${actualIndex}] '${char}' (${charCode})${marker}`;
+        })
+        .join("\n");
+    } catch (error) {
+      return `Debug error: ${error.message}`;
+    }
   }
 
   validateOutput(obj) {
@@ -415,45 +619,58 @@ class MarketPeakDataAggregator {
    * @returns {Object} Analysis result with score, reasoning, and metadata
    */
   async analyze() {
-    const t0 = Date.now(); // Start timing for performance tracking
+    try {
+      const t0 = Date.now(); // Start timing for performance tracking
 
-    // Step 1: Build comprehensive data object from all sources
-    const templateData = await this.buildPromptData();
+      // Step 1: Build comprehensive data object from all sources
+      const templateData = await this.buildPromptData();
 
-    // Step 2: Call AI model for analysis
-    const aiText = await this.callLLM(templateData);
+      // Step 2: Call AI model for analysis
+      const aiText = await this.callLLM(templateData);
 
-    // Step 3: Parse AI response into structured JSON
-    const parsed = this.parseJsonFromText(aiText);
+      // Step 3: Parse AI response into structured JSON
+      const parsed = this.parseJsonFromText(aiText);
 
-    // Step 4: Validate the output format
-    this.validateOutput(parsed);
+      // Step 4: Validate the output format
+      this.validateOutput(parsed);
 
-    // Step 5: Enrich with metadata
-    const enriched = {
-      ...parsed,
-      analysis_metadata: {
-        model: CONFIG.MODEL,
-        data_sources: ["BULL_PEAK", "BTC", "ETH", "SOL"],
-        collection_duration_ms: Date.now() - t0,
-      },
-    };
+      // Step 5: Enrich with metadata
+      const enriched = {
+        ...parsed,
+        analysis_metadata: {
+          model: CONFIG.MODEL,
+          data_sources: ["BULL_PEAK", "BTC", "ETH", "SOL"],
+          collection_duration_ms: Date.now() - t0,
+        },
+      };
 
-    // Step 6: Store result in Firestore
-    const storage = await this.storeResult(enriched);
+      // Step 6: Store result in Firestore
+      const storage = await this.storeResult(enriched);
 
-    // Step 7: Log analysis result with interpretation
-    console.log(
-      `📈 [ANALYSIS] Market Peak Score: ${parsed.score}/100 (${
-        parsed.score >= 60
-          ? "Peak Likely"
-          : parsed.score >= 25
-          ? "Mixed Signals"
-          : "Normal"
-      })`
-    );
+      // Step 7: Log analysis result with interpretation
+      console.log(
+        `📈 [ANALYSIS] Market Peak Score: ${parsed.score}/100 (${
+          parsed.score >= 60
+            ? "Peak Likely"
+            : parsed.score >= 25
+            ? "Mixed Signals"
+            : "Normal"
+        })`
+      );
 
-    return { success: true, analysis: enriched, storage };
+      return { success: true, analysis: enriched, storage };
+    } catch (error) {
+      console.error(
+        "❌ [ANALYSIS] Market Peak analysis failed:",
+        error.message
+      );
+
+      return {
+        success: false,
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
+    }
   }
 
   async getRecent(limit = 10) {
